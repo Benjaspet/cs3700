@@ -1,0 +1,301 @@
+#!/usr/bin/env python3
+
+# Project 5: Fakebook Crawler
+# Developed by: Ben Petrillo
+# March 27, 2024
+
+import argparse, socket, ssl, time, threading, urllib.parse
+from collections import deque
+from urllib.parse import urlparse
+from html.parser import HTMLParser
+
+class FakebookHTMLParser(HTMLParser):
+
+    def __init__(self, server, port, visited, queue, flags):
+        super().__init__()
+        self.server = server
+        self.port = port
+        self.flags = flags
+        self.queue = queue
+        self.visited = visited
+
+    # Handle the start tag of the HTML content and check if it is an anchor tag with an href attribute.
+    # This is used to extract all the URLs from the page and add them to the queue if they are not already
+    # visited or in the queue.
+    def handle_starttag(self, tag, attrs):
+        if tag == "a" and attrs and "href" in attrs[0] and "/fakebook/" in attrs[0][1]:
+            url = f"https://{self.server}:{self.port}{attrs[0][1]}"
+            if url not in self.visited and url not in self.queue:
+                self.queue.append(url)
+
+    # If the data of this attribute contains the flag, extract it and print it to STDOUT. This approach
+    # prints the flags as we find them, instead of printing them all at once at the end.
+    def handle_data(self, data):
+        if "FLAG: " in data:
+            flag = data.split(": ")[1]
+            self.flags.append(flag)
+            print(flag)
+
+class Crawler:
+
+    def __init__(self, args):
+        self.server = args.server
+        self.port = args.port
+        self.username = args.username
+        self.password = args.password
+        self.verbose = args.verbose
+        self.csrfToken = None
+        self.sessionId = None
+        self.queue = deque()
+        self.visited = set()
+        self.flags = []
+        self.start_time = time.time()
+
+    # Login to Fakebook and return the response from the POST request. The GET request
+    # is used to gather the CSRF token and session ID and store them in class variables
+    # so that they can be used in the POST request and future GET requests to prevent having
+    # to log in every single time.
+    def login(self, url):
+        self.send_get_request(url)
+        return self.send_post_request(url)
+
+    # Create an SSL connection to the server and return the socket.
+    # Note: This is not the optimal approach, and that I should be only creating a
+    # socket for each thread I am running. TODO: implement Keep-Alive.
+    def create_ssl_connection(self):
+        context = ssl.create_default_context()
+        raw_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        ssl_socket = context.wrap_socket(raw_socket, server_hostname=self.server)
+        try:
+            ssl_socket.connect((self.server, self.port))
+        except socket.error as e:
+            print(f"ERROR: Unable to connect to {self.server}:{self.port}. Exiting...")
+            exit(1)
+        return ssl_socket
+
+    # Format the runtime as a clean display to the verbose logger.
+    def format_runtime(self, ms_input):
+        minutes = int(ms_input / 60000)
+        seconds = int((ms_input % 60000) / 1000)
+        milliseconds = int(ms_input % 1000)
+        return f"Runtime: {minutes}m {seconds}s {milliseconds}ms"
+
+    # Continuously receive data from the socket until there is no more data to receive. I do this
+    # up to 1024 bytes at a time to prevent the socket from blocking and to ensure that I am not
+    # waiting for data that is not coming. It is always best to receive data in chunks.
+    def receive_data(self, ssl_socket):
+        response_parts = []
+        while True:
+            chunk = ssl_socket.recv(1024)
+            if not chunk:
+                break
+            response_parts.append(chunk.decode('utf-8'))
+        return ''.join(response_parts)
+
+    # Send a request to the server and return the response. This is a general method that can be
+    # used for both GET and POST requests. The response is processed and the status code is checked
+    # to determine the next action to take.
+    def send_req(self, request, url):
+        # Create the socket and send all data to the server in UTF-8 encoding.
+        ssl_socket = self.create_ssl_connection()
+        ssl_socket.sendall(request.encode('utf-8'))
+        # Receive the response from the server and close the socket.
+        response = self.receive_data(ssl_socket)
+        ssl_socket.close()
+        # Process the response and handle the status code.
+        processed_response = self.process_response(response)
+        return self.process_status_code(processed_response, url)
+
+    # Send a GET request to the server and return the response. If cookies are available (i.e. for
+    # any request other than the login request), include them in the headers. The response is then
+    # processed and the status code is checked to determine the next action to take.
+    def send_get_request(self, url):
+        # Mark the URL as visited and remove it from the queue.
+        self.visited.add(url)
+        if url in self.queue:
+            self.queue.remove(url)
+        # Parse the URL to check if it matches the expected hostname and port
+        parsed_url = urlparse(url)
+        # Construct the HTTP GET request line by line
+        headers = [
+            f"GET {parsed_url.path} HTTP/1.1",
+            f"Host: {self.server}",
+            "Connection: Close"
+        ]
+        # Include cookies if available.
+        if self.get_cookie_data():
+            headers.append("Cookie: " + self.get_cookie_data())
+        request = "\r\n".join(headers) + "\r\n\r\n"
+        # Send the request and return the response.
+        return self.send_req(request, url)
+
+    # Send a POST request to the server and return the response. This method is used to log in to Fakebook.
+    # The login data is stored in a dictionary and URL encoded. The headers are then prepared for the POST
+    # request, including the encoded login data. The request is then sent to Fakebook.
+    def send_post_request(self, url):
+        # Because we are about to visit this URL, mark it as visited and remove it from the queue.
+        self.visited.add(url)
+        if url in self.queue:
+            self.queue.remove(url)
+        # Then, store the login data in a dictionary and URL encode it.
+        login_data = {"username": self.username, "password": self.password, "csrfmiddlewaretoken": self.csrfToken}
+        encoded_login_data = urllib.parse.urlencode(login_data)
+        # Prepare all the headers for the POST request, including the encoded login data.
+        # Then, send the request to Fakebook.
+        req = self.format_login_post_data(encoded_login_data)
+        return self.send_req(req, url)
+
+    # Format the login POST data with the encoded login data and the required headers.
+    def format_login_post_data(self, encoded_data):
+        headers = (
+            f"POST /accounts/login/?next=/fakebook/ HTTP/1.1\r\n"
+            f"Host: {self.server}\r\n"
+            "Connection: Close\r\n"
+            "Content-Type: application/x-www-form-urlencoded\r\n"
+            f"Content-Length: {len(encoded_data)}\r\n"
+            f"Cookie: {self.get_cookie_data()}\r\n\r\n"
+        )
+        return f"{headers}{encoded_data}"
+
+    # Process the response by splitting it into header and body parts and extracting the data we need to.
+    # First, split the response into header and body parts using the first occurrence of '\r\n\r\n'.
+    # Then we initialize the response dictionary with the HTTP status code and the body. The status code
+    # is extracted from the first line of the header and the body is added directly. I then iterate over
+    # each header to extract the key and value pairs. If the header is a 'Set-Cookie' header, I extract
+    # the cookie values and store them in the class variables. If the header is a 'Location' header, I add
+    # the value to the response dictionary. Finally, I return the response dictionary.
+    def process_response(self, get_response):
+        header_part, _, body = get_response.partition('\r\n\r\n')
+        headers = header_part.split('\r\n')
+        response = {
+            "status": headers[0].split(' ')[1].strip(),
+            "body": body if body else None  # Use the body directly if present.
+        }
+        # Iterate over each header (excluding the first line, the status line).
+        for header in headers[1:]:
+            key, _, value = header.partition(':')
+            # Strip whitespaces.
+            key, value = key.strip(), value.strip()
+            # If the header is a 'Set-Cookie' header, extract the cookie values.
+            if key.lower() == "set-cookie":
+                cookie_type, cookie_value = value.split(';', 1)[0].split('=', 1)
+                if cookie_type.lower() == "csrftoken":
+                    self.csrfToken = cookie_value
+                elif cookie_type.lower() == "sessionid":
+                    self.sessionId = cookie_value
+            # Get the location header to handle redirects.
+            elif key.lower() == "location":
+                response["location"] = value
+        return response
+
+    # Construct a cookie header from the stored CSRF token and session ID. This uses a dynamic
+    # approach to filter out null values and join the remaining cookies.
+    def get_cookie_data(self):
+        cookies = {"csrftoken": self.csrfToken, "sessionid": self.sessionId}
+        return "; ".join(f"{k}={v}" for k, v in cookies.items() if v is not None)
+
+    # Handle the status code of the response and determine the next action to take.
+    # If it is a 200, return the response. If it is a 302, redirect to the new URL.
+    # If it is a 403 or 404, skip it. If it is a 503, retry the URL. If it is a 500 or 504,
+    # print an error message and exit the program. Otherwise, print an error message and exit.
+    def process_status_code(self, response, url):
+        status_code = int(response["status"])
+        if status_code == 200:
+            return response
+        elif status_code == 302:
+            self.redirect(response, url)
+        elif status_code == 403 or status_code == 404:
+            return None
+        elif status_code == 503:
+            self.retry(url)
+        elif status_code == 500 or status_code == 504:
+            print("ERROR: Internal server error encountered.")
+            exit(1)
+        else:
+            print(f"ERROR: Unexpected status code {status_code} encountered.")
+            exit(1)
+
+    # Redirect to the new URL by parsing the location header and appending it to the base URL.
+    def redirect(self, response, url):
+        parsed_url = urlparse(url)
+        new_url = f"{parsed_url.scheme}://{parsed_url.netloc}{response['location']}"
+        self.queue.appendleft(new_url)
+
+    # Retry the URL by appending it to the left side of the queue.
+    def retry(self, url):
+        self.queue.appendleft(url)
+
+    # Crawl the URL by sending a GET request to the server and parsing the response using the parser.
+    def crawl(self, html_parser):
+        if self.queue:
+            if len(self.flags) >= 5:
+                return
+            url = self.queue.pop()
+            response = self.send_get_request(url)
+            if response:
+                if response["status"] == "200":
+                    html_parser.feed(response["body"])
+
+    # Run the web crawler by logging in to Fakebook and crawling the pages to find the flags.
+    def run(self):
+        # First, log in to Fakebook and get the CSRF token and session ID.
+        try:
+            self.login(f"https://{self.server}:{self.port}/accounts/login/?next=/fakebook/")
+        except socket.error:
+            print(f"ERROR: Unable to log in. Exiting...")
+            exit(1)
+        # Handling command line arguments.
+        if args.threads < 1:
+            print("Invalid number of threads")
+            return
+        elif args.threads > 10:
+            print("You can use at most 10 threads")
+            return
+        # Create parsers equal to the number of threads provided. Default to 5.
+        s, p, v, q, f = self.server, self.port, self.visited, self.queue, self.flags
+        parsers = [FakebookHTMLParser(s, p, v, q, f) for _ in range(int(args.threads))]
+        # Continuously crawl the pages until 5 flags are found.
+        while len(self.flags) < 5:
+            try:
+                # Use locks to prevent STDOUT corruption from multiple threads.
+                with threading.Lock():
+                    runtime_ms = (time.time() - self.start_time) * 1000
+                    rt = self.format_runtime(runtime_ms)
+                    # If the verbose flag is set, print debug information.
+                    if self.verbose:
+                        flags_found = "Flags Found: %2d" % len(self.flags)
+                        visited = "Visited: %5d" % len(self.visited)
+                        to_visit = "To Visit: %5d" % len(self.queue)
+                        print(f"{flags_found} | {visited} | {to_visit} | {rt}")
+                # Crea the threads and start them.
+                threads = []
+                for p in parsers:
+                    # Create a thread for each parser and start it.
+                    thread = threading.Thread(target=self.crawl, args=(p,))
+                    threads.append(thread)
+                    thread.start()
+                # Join the threads to wait for them to finish.
+                for thread in threads:
+                    thread.join()
+            # Handle keyboard interrupts and general exceptions.
+            except KeyboardInterrupt:
+                print("Exiting...")
+                return
+            except Exception as e:
+                print(f"ERROR: {e}")
+                return
+
+# Program Usage:
+# python3 3700crawler [-h] [-s SERVER] [-p PORT] [-v VERBOSE] [-t THREADS] username password
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='crawl Fakebook')
+    parser.add_argument('-s', dest="server", type=str, default="www.3700.network", help="The server to crawl.")
+    parser.add_argument('-p', dest="port", type=int, default=443, help="The port of the server.")
+    parser.add_argument('username', type=str, help="The username to use.")
+    parser.add_argument('password', type=str, help="The password to use.")
+    parser.add_argument("-v", "--verbose", action="store_true", required=False, help="Whether or not to log debug information.")
+    parser.add_argument("-t", "--threads", type=int, default=5, help="The number of threads to use.")
+    args = parser.parse_args()
+    sender = Crawler(args)
+    sender.run()
